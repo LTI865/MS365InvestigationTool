@@ -1,6 +1,6 @@
 # =============================================================================
 # LTI MS365 Investigation Utility
-# REV 2.2 - MFA Scan Fix Build
+# REV 2.3 - Sign-In IP Fix Build
 # =============================================================================
 #
 # WPF GUI for Microsoft 365 account compromise investigations.
@@ -27,6 +27,17 @@
 # License Compatibility: Exchange Online Plan 1 and above.
 # Does NOT require Entra ID P1/P2. With P1/P2 the MFA panel also shows the
 # user's real default MFA method and 30 days of MFA audit history (7 on Free).
+#
+# REV 2.3 changes
+#   FIX  IP addresses were blank in the sign-in export and UniqueIPs was
+#        always 0. The script read AuditData.ClientIPAddress for every
+#        record, but only Exchange mailbox records use that name - Entra
+#        sign-in records carry the address in ClientIP / ActorIpAddress, as
+#        do SharePoint and admin records. Every step now reads the right
+#        field (steps 1, 9, 10, 11, 12, 13 and 16 were affected).
+#   NEW  01_SignIn_Events.csv has an ErrorCode column (AADSTS code, e.g.
+#        50126 wrong password, 50057 account disabled).
+#   NEW  Master summary lists each mailbox's sign-in IPs with ok/failed counts.
 #
 # REV 2.2 changes
 #   FIX  MFA scan aborted with "Cannot bind argument to parameter
@@ -93,7 +104,7 @@ trap {
     continue
 }
 
-Write-Log "Script started - LTI MS365 Investigation Utility REV 2.2 (PowerShell $($PSVersionTable.PSVersion))"
+Write-Log "Script started - LTI MS365 Investigation Utility REV 2.3 (PowerShell $($PSVersionTable.PSVersion))"
 
 if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
     Write-Host "ExchangeOnlineManagement module not found. Installing..." -ForegroundColor Yellow
@@ -1739,6 +1750,45 @@ function Get-MessageTraceV2All { param([string]$SenderAddress,[string]$Recipient
     return $all
 }
 
+function Get-LTIAuditIP {
+    # The client IP sits in a different AuditData property depending on the workload:
+    #   Exchange mailbox records     -> ClientIPAddress
+    #   Entra ID sign-in records     -> ClientIP / ActorIpAddress
+    #   SharePoint and admin records -> ClientIP
+    # REV 2.2 and earlier read ClientIPAddress for everything, so sign-in, OAuth,
+    # SharePoint and admin records all came back with a blank IP.
+    # Returns the first one present, with any port and IPv6 brackets removed.
+    param($AuditData)
+
+    if ($null -eq $AuditData) { return "" }
+    foreach ($name in @('ClientIPAddress', 'ClientIP', 'ActorIpAddress', 'ActorIP')) {
+        $v = [string]$AuditData.$name
+        if ([string]::IsNullOrWhiteSpace($v)) { continue }
+        $v = $v.Trim()
+        if ($v -match '^\[([^\]]+)\](:\d+)?$') { return $Matches[1] }           # [2001:db8::1]:443
+        if ($v -match '^(\d{1,3}(\.\d{1,3}){3}):\d+$') { return $Matches[1] }    # 203.0.113.5:51234
+        return $v
+    }
+    return ""
+}
+
+function Get-LTISignInIPSummary {
+    # "203.0.113.5 (41 ok / 2 failed); 198.51.100.7 (0 ok / 78 failed)" - busiest first.
+    param($SignIns, [int]$Max = 10)
+
+    $groups = @(@($SignIns) | Where-Object { $_ -and $_.ClientIP } | Group-Object -Property ClientIP | Sort-Object -Property Count -Descending)
+    if ($groups.Count -eq 0) { return "" }
+
+    $parts = @($groups | Select-Object -First $Max | ForEach-Object {
+        $ok   = @($_.Group | Where-Object { $_.Operation -eq "UserLoggedIn" }).Count
+        $fail = @($_.Group | Where-Object { $_.Operation -eq "UserLoginFailed" }).Count
+        "$($_.Name) ($ok ok / $fail failed)"
+    })
+    $text = $parts -join "; "
+    if ($groups.Count -gt $Max) { $text += "; +$($groups.Count - $Max) more" }
+    return $text
+}
+
 function Export-ResultSet { param([string]$Name,[string]$FileName,[string]$OutFolder,$Data)
     $fp=Join-Path $OutFolder $FileName
     if ($null -eq $Data -or ($Data -is [System.Collections.IEnumerable] -and @($Data).Count -eq 0)) {
@@ -1969,7 +2019,7 @@ function Invoke-BaselineComparison {
 # -----------------------------------------------------------------------------
 function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[DateTime]$EndDate,[string]$OutputFolder,[hashtable]$EnabledSteps)
     if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
-    $findings=[PSCustomObject]@{UPN=$UPN;DisplayName="";SignInsOK=0;SignInsFailed=0;UniqueIPs=0;ForwardingActive=$false;ForwardingTarget="";SuspiciousRules=0;TotalRules=0;OAuthConsents=0;AdminActions=0;FileEvents=0;OutboundMail=0;AuditEnabled=$null;MFAStatus="NotChecked";MFAMethods="";NewMFAMethods=0;AccountEnabled="";Errors=[System.Collections.Generic.List[string]]::new()}
+    $findings=[PSCustomObject]@{UPN=$UPN;DisplayName="";SignInsOK=0;SignInsFailed=0;UniqueIPs=0;SignInIPs="";ForwardingActive=$false;ForwardingTarget="";SuspiciousRules=0;TotalRules=0;OAuthConsents=0;AdminActions=0;FileEvents=0;OutboundMail=0;AuditEnabled=$null;MFAStatus="NotChecked";MFAMethods="";NewMFAMethods=0;AccountEnabled="";Errors=[System.Collections.Generic.List[string]]::new()}
     # AuditEnabled stays $null and MFAStatus stays "NotChecked" until the relevant check
     # actually runs, so a skipped or failed check is never reported as "off".
 
@@ -1980,17 +2030,20 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[1]) { Add-Log "======================================================================"; Add-Log "  1. Sign-In and Authentication Events"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("UserLoggedIn","UserLoginFailed","ForeignRealmIndexLogonInitialAuthUsingADFSFederatedToken","PasswordLogonInitialAuthUsingPassword")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;ResultStatus=$a.ResultStatus;LogonError=$a.LogonError;ClientIP=$a.ClientIPAddress;UserAgent=$a.ExtendedProperties|Where-Object{$_.Name -eq "UserAgent"}|Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue;RequestType=$a.ExtendedProperties|Where-Object{$_.Name -eq "RequestType"}|Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue;Application=$a.ApplicationId;Workload=$a.Workload}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;ResultStatus=$a.ResultStatus;LogonError=$a.LogonError;ErrorCode=$(if($null -ne $a.ErrorCode -and "$($a.ErrorCode)" -ne ''){$a.ErrorCode}else{$a.ErrorNumber});ClientIP=(Get-LTIAuditIP $a);UserAgent=$a.ExtendedProperties|Where-Object{$_.Name -eq "UserAgent"}|Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue;RequestType=$a.ExtendedProperties|Where-Object{$_.Name -eq "RequestType"}|Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue;Application=$a.ApplicationId;Workload=$a.Workload}}
             Export-ResultSet -Name "Sign-In Events" -FileName "01_SignIn_Events.csv" -OutFolder $OutputFolder -Data $parsed
             $findings.SignInsOK=@($parsed|Where-Object{$_.Operation -eq "UserLoggedIn"}).Count; $findings.SignInsFailed=@($parsed|Where-Object{$_.Operation -eq "UserLoginFailed"}).Count; $findings.UniqueIPs=@($parsed|Where-Object{$_.ClientIP}|Select-Object -ExpandProperty ClientIP -Unique).Count
+            $findings.SignInIPs=Get-LTISignInIPSummary -SignIns $parsed
             Add-Log "  Sign-ins: $($findings.SignInsOK) ok, $($findings.SignInsFailed) failed, $($findings.UniqueIPs) IPs"
+            if($findings.SignInIPs){Add-Log "  IPs: $($findings.SignInIPs)"}
+            if(($findings.SignInsOK + $findings.SignInsFailed) -gt 0 -and $findings.UniqueIPs -eq 0){Add-Log "  [WARN] $($findings.SignInsOK + $findings.SignInsFailed) sign-in record(s) came back with no IP address in ClientIP or ActorIpAddress. Check the Entra sign-in log for this user."}
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("Sign-ins: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 1" }
 
     if ($EnabledSteps[2]) { Add-Log "======================================================================"; Add-Log "  2. Mailbox Activity"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("MailboxLogin","MailItemsAccessed","Send","SendAs","SendOnBehalf","Create","HardDelete","SoftDelete","MoveToDeletedItems","Update","Copy","Move")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops -RecordTypes @("ExchangeItem","ExchangeItemAggregated")
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;ClientIP=$a.ClientIPAddress;ClientInfo=$a.ClientInfoString;ItemSubject=$a.Item.Subject;Folder=$a.Item.ParentFolder.Path;ResultStatus=$a.ResultStatus}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;ClientIP=(Get-LTIAuditIP $a);ClientInfo=$a.ClientInfoString;ItemSubject=$a.Item.Subject;Folder=$a.Item.ParentFolder.Path;ResultStatus=$a.ResultStatus}}
             Export-ResultSet -Name "Mailbox Activity" -FileName "02_Mailbox_Activity.csv" -OutFolder $OutputFolder -Data $parsed
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("Mailbox: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 2" }
@@ -2037,7 +2090,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[9]) { Add-Log "======================================================================"; Add-Log "  9. OAuth / App Consent"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("Consent to application.","Add OAuth2PermissionGrant.","Add app role assignment grant to user.","Add delegated permission grant.","Add application.")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops -RecordTypes @("AzureActiveDirectory")
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Target=($a.Target|ForEach-Object{$_.Id}) -join '; ';ModifiedProps=($a.ModifiedProperties|ForEach-Object{"$($_.Name)=$($_.NewValue)"}) -join '; ';ClientIP=$a.ClientIPAddress;ResultStatus=$a.ResultStatus;ActorUPN=$a.UserId}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Target=($a.Target|ForEach-Object{$_.Id}) -join '; ';ModifiedProps=($a.ModifiedProperties|ForEach-Object{"$($_.Name)=$($_.NewValue)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a);ResultStatus=$a.ResultStatus;ActorUPN=$a.UserId}}
             Export-ResultSet -Name "OAuth" -FileName "09_OAuth_App_Consent.csv" -OutFolder $OutputFolder -Data $parsed; $findings.OAuthConsents=@($parsed).Count
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("OAuth: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 9" }
@@ -2045,7 +2098,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[10]) { Add-Log "======================================================================"; Add-Log "  10. Rule Changes"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("New-InboxRule","Set-InboxRule","Enable-InboxRule","Remove-InboxRule","UpdateInboxRules","New-TransportRule","Set-TransportRule")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=$a.ClientIPAddress;SessionId=$a.SessionId}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a);SessionId=$a.SessionId}}
             Export-ResultSet -Name "Rule Changes" -FileName "10_Rule_Changes.csv" -OutFolder $OutputFolder -Data $parsed
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("RuleChg: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 10" }
@@ -2053,7 +2106,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[11]) { Add-Log "======================================================================"; Add-Log "  11. File Activity"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("FileDownloaded","FileUploaded","FileDeleted","FileModified","FileRenamed","FileMoved","FileCopied","SharingSet","AnonymousLinkCreated","CompanyLinkCreated","SharingInvitationCreated","AddedToSecureLink")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops -RecordTypes @("SharePointFileOperation")
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;FileName=$a.SourceFileName;FileUrl=$a.ObjectId;SiteUrl=$a.SiteUrl;ClientIP=$a.ClientIPAddress;UserAgent=$a.UserAgent}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;FileName=$a.SourceFileName;FileUrl=$a.ObjectId;SiteUrl=$a.SiteUrl;ClientIP=(Get-LTIAuditIP $a);UserAgent=$a.UserAgent}}
             Export-ResultSet -Name "File Activity" -FileName "11_File_Activity.csv" -OutFolder $OutputFolder -Data $parsed; $findings.FileEvents=@($parsed).Count
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("Files: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 11" }
@@ -2061,7 +2114,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[12]) { Add-Log "======================================================================"; Add-Log "  12. Admin Actions"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("Add member to role.","Add user.","Reset user password.","Set force change user password.","Update user.","Delete user.","Set-Mailbox","Add-MailboxPermission","Remove-MailboxPermission","New-ManagementRoleAssignment")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Target=($a.Target|ForEach-Object{$_.Id}) -join '; ';Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=$a.ClientIPAddress;ResultStatus=$a.ResultStatus}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Target=($a.Target|ForEach-Object{$_.Id}) -join '; ';Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a);ResultStatus=$a.ResultStatus}}
             Export-ResultSet -Name "Admin Actions" -FileName "12_Admin_Actions.csv" -OutFolder $OutputFolder -Data $parsed; $findings.AdminActions=@($parsed).Count
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("Admin: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 12" }
@@ -2069,7 +2122,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[13]) { Add-Log "======================================================================"; Add-Log "  13. eDiscovery"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("SearchStarted","SearchExportDownloaded","New-ComplianceSearch","New-ComplianceSearchAction","CaseAdded")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=$a.ClientIPAddress}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a)}}
             Export-ResultSet -Name "eDiscovery" -FileName "13_eDiscovery_Activity.csv" -OutFolder $OutputFolder -Data $parsed
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("eDisc: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 13" }
@@ -2091,7 +2144,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
 
     if ($EnabledSteps[16]) { Add-Log "======================================================================"; Add-Log "  16. Catch-All Audit"; Add-Log "======================================================================"; Add-Log "  Pulling ALL records..."; Flush-UI
         try { $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;RecordType=$_.RecordType;Operation=$a.Operation;Workload=$a.Workload;ClientIP=$a.ClientIPAddress;ResultStatus=$a.ResultStatus;ObjectId=$a.ObjectId}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;RecordType=$_.RecordType;Operation=$a.Operation;Workload=$a.Workload;ClientIP=(Get-LTIAuditIP $a);ResultStatus=$a.ResultStatus;ObjectId=$a.ObjectId}}
             Export-ResultSet -Name "All Audit" -FileName "16_All_Audit_Activity.csv" -OutFolder $OutputFolder -Data $parsed
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("CatchAll: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 16" }
@@ -2276,7 +2329,7 @@ $btnRun.Add_Click({
     # --- Master CSV ---
     $csvPath=Join-Path $rootFolder "_MASTER_SUMMARY.csv"
     # MFAEnabled is True / False, or blank when MFA was not checked or the lookup failed (see MFAStatus).
-    $csvData=foreach($f in $allFindings){$mfa=Get-LTIMFAVerdict -Findings $f;[PSCustomObject]@{UPN=$f.UPN;DisplayName=$f.DisplayName;MFAEnabled=$mfa.EnabledText;MFAStatus=$f.MFAStatus;MFAMethods=$f.MFAMethods;NewMFAMethods=$f.NewMFAMethods;SignInAllowed=$f.AccountEnabled;SignInsOK=$f.SignInsOK;SignInsFailed=$f.SignInsFailed;UniqueIPs=$f.UniqueIPs;ForwardingActive=$f.ForwardingActive;ForwardingTarget=$f.ForwardingTarget;SuspiciousRules=$f.SuspiciousRules;TotalRules=$f.TotalRules;OAuthConsents=$f.OAuthConsents;AdminActions=$f.AdminActions;FileEvents=$f.FileEvents;OutboundMail=$f.OutboundMail;AuditEnabled=$f.AuditEnabled;Errors=($f.Errors -join '; ')}}
+    $csvData=foreach($f in $allFindings){$mfa=Get-LTIMFAVerdict -Findings $f;[PSCustomObject]@{UPN=$f.UPN;DisplayName=$f.DisplayName;MFAEnabled=$mfa.EnabledText;MFAStatus=$f.MFAStatus;MFAMethods=$f.MFAMethods;NewMFAMethods=$f.NewMFAMethods;SignInAllowed=$f.AccountEnabled;SignInsOK=$f.SignInsOK;SignInsFailed=$f.SignInsFailed;UniqueIPs=$f.UniqueIPs;SignInIPs=$f.SignInIPs;ForwardingActive=$f.ForwardingActive;ForwardingTarget=$f.ForwardingTarget;SuspiciousRules=$f.SuspiciousRules;TotalRules=$f.TotalRules;OAuthConsents=$f.OAuthConsents;AdminActions=$f.AdminActions;FileEvents=$f.FileEvents;OutboundMail=$f.OutboundMail;AuditEnabled=$f.AuditEnabled;Errors=($f.Errors -join '; ')}}
     @($csvData)|Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8; Add-Log "Master CSV: $csvPath"
 
     # --- Master TXT ---
@@ -2290,6 +2343,7 @@ $btnRun.Add_Click({
         $m=if($ha){"[!!!]"}else{"[OK] "}; $sl.Add("$m $($f.UPN) ($($f.DisplayName))"); $sl.Add("      MFA: $($mfa.Text)")
         if($f.NewMFAMethods -gt 0){$sl.Add("      *** $($f.NewMFAMethods) MFA METHOD(S) ADDED IN THE INVESTIGATION WINDOW - see 17a_MFA_Method_Details.csv")}
         $sl.Add("      Sign-ins: $($f.SignInsOK) ok / $($f.SignInsFailed) failed / $($f.UniqueIPs) IPs")
+        if($f.SignInIPs){$sl.Add("      IPs: $($f.SignInIPs)")}
         if($f.ForwardingActive){$sl.Add("      *** FORWARDING -> $($f.ForwardingTarget)")}; if($f.SuspiciousRules -gt 0){$sl.Add("      *** $($f.SuspiciousRules) SUSPICIOUS RULES")}
         if($f.OAuthConsents -gt 0){$sl.Add("      *** $($f.OAuthConsents) OAuth consents")}
         if($f.AuditEnabled -eq $false){$sl.Add("      *** Auditing DISABLED")}elseif($null -eq $f.AuditEnabled){$sl.Add("      Auditing: not checked")}
