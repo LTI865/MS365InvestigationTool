@@ -1,6 +1,6 @@
 # =============================================================================
 # LTI MS365 Investigation Utility
-# REV 2.3 - Sign-In IP Fix Build
+# REV 2.5 - Log Reach, UTC Timestamps, Bulk ASN Lookup Build
 # =============================================================================
 #
 # WPF GUI for Microsoft 365 account compromise investigations.
@@ -27,6 +27,46 @@
 # License Compatibility: Exchange Online Plan 1 and above.
 # Does NOT require Entra ID P1/P2. With P1/P2 the MFA panel also shows the
 # user's real default MFA method and 30 days of MFA audit history (7 on Free).
+#
+# REV 2.5 changes
+#   FIX  Report times. "Generated" and the empty-result markers printed LOCAL
+#        time with a Z suffix. Every stamp is now real UTC (with local time
+#        beside it), and every audit / mail-trace row uses the same
+#        "yyyy-MM-dd HH:mm:ss UTC" format so timelines line up across files.
+#   FIX  MFA audit events (17b) missed Windows Hello for Business keys,
+#        device-bound passkeys, platform credentials and legacy per-user MFA
+#        switches - Entra logs those under other services than the one the
+#        script queried.
+#   FIX  ASN lookup (opt-in) labelled only the first few IPs when the DNS
+#        resolver started timing out, and said nothing. It now sends the whole
+#        list to Team Cymru in ONE bulk whois connection, falls back to DNS
+#        with a retry if TCP 43 is blocked, and reports how many IPs it could
+#        not label.
+#   NEW  Log reach check. Entra ID Free keeps sign-in and audit logs for 7
+#        days; P1/P2 keeps 30, counted from the day the licence was added. A
+#        30-day run on such a tenant gets 7 days of Entra data and nothing
+#        said so. The run now tests whether the tenant's logs hold anything
+#        older than a week and states the result in the log, the master
+#        summary and each mailbox's Entra status.
+#   NOTE Nothing in the script limits the Entra steps to 7 days: step 18 uses
+#        the Days Back value and 17b always asks for 30.
+#
+# REV 2.4 changes
+#   NEW  Step 18 - Entra sign-in log, interactive AND non-interactive, per
+#        mailbox (18_Entra_SignIns.csv). Non-interactive sign-ins are the
+#        token refreshes where a stolen session shows up; the unified audit
+#        log used by step 1 does not show them. Needs the same Graph sign-in
+#        as the MFA step (click "Refresh MFA" first). How far back it reaches
+#        depends on the tenant's Entra licence - see the REV 2.5 note above.
+#   NEW  Country and ASN next to every IP in the master summary, taken from
+#        Microsoft's own sign-in geolocation.
+#   NEW  _SIGNIN_IP_SUMMARY.csv - one row per mailbox + IP: country, city,
+#        ASN, ok/failed counts per log, first and last seen.
+#   NEW  Optional (off by default): look up ASN / network name / registered
+#        country for IPs Microsoft did not label, via Team Cymru's public
+#        IP-to-ASN service over DNS. This sends those IPs to a third party.
+#   NEW  Run asks before starting when steps 17/18 are ticked but there is
+#        no Graph sign-in, instead of quietly producing "not checked".
 #
 # REV 2.3 changes
 #   FIX  IP addresses were blank in the sign-in export and UniqueIPs was
@@ -104,7 +144,7 @@ trap {
     continue
 }
 
-Write-Log "Script started - LTI MS365 Investigation Utility REV 2.3 (PowerShell $($PSVersionTable.PSVersion))"
+Write-Log "Script started - LTI MS365 Investigation Utility REV 2.5 (PowerShell $($PSVersionTable.PSVersion))"
 
 if (-not (Get-Module -ListAvailable -Name ExchangeOnlineManagement)) {
     Write-Host "ExchangeOnlineManagement module not found. Installing..." -ForegroundColor Yellow
@@ -348,6 +388,7 @@ $xaml = @'
                         <CheckBox x:Name="chkStep14" Content="14. Message Trace (Mail Flow)" IsChecked="True"/>
                         <CheckBox x:Name="chkStep15" Content="15. Mailbox Audit Config" IsChecked="True"/>
                         <CheckBox x:Name="chkStep16" Content="16. Catch-All Audit Dump" IsChecked="True"/>
+                        <CheckBox x:Name="chkStep18" Content="18. Entra Sign-In Log (incl. non-interactive)" IsChecked="True" ToolTip="Needs a Graph sign-in (click Refresh MFA first) and Entra ID P1/P2"/>
                     </StackPanel>
                 </Grid>
             </Border>
@@ -379,7 +420,11 @@ $xaml = @'
         </Grid>
 
         <!-- Checkboxes row -->
-        <CheckBox Grid.Row="8" x:Name="chkOpenFolder" Content="Open output folder when complete" IsChecked="True" Margin="0,0,0,10"/>
+        <StackPanel Grid.Row="8" Margin="0,0,0,10">
+            <CheckBox x:Name="chkOpenFolder" Content="Open output folder when complete" IsChecked="True"/>
+            <CheckBox x:Name="chkGeoLookup" Content="Look up ASN / network for unlabelled IPs (sends those IPs to Team Cymru over DNS)" IsChecked="False" Margin="0,4,0,0"
+                      ToolTip="Off: country and ASN come only from the Entra sign-in log (step 18). On: unlabelled IPs are also looked up with Team Cymru's public IP-to-ASN service."/>
+        </StackPanel>
 
         <!-- Run Button -->
         <Button Grid.Row="9" x:Name="btnRun" Content="Run Investigation" FontSize="15" FontWeight="Bold" Padding="16,10"
@@ -410,7 +455,7 @@ $txtDomain=$window.FindName("txtDomain"); $btnConnect=$window.FindName("btnConne
 $lblConnectionStatus=$window.FindName("lblConnectionStatus"); $lstMailboxes=$window.FindName("lstMailboxes"); $txtFilter=$window.FindName("txtFilter")
 $btnSelectAll=$window.FindName("btnSelectAll"); $btnSelectNone=$window.FindName("btnSelectNone"); $lblMailboxCount=$window.FindName("lblMailboxCount")
 $cmbDaysBack=$window.FindName("cmbDaysBack"); $txtOutputPath=$window.FindName("txtOutputPath"); $btnBrowse=$window.FindName("btnBrowse")
-$chkOpenFolder=$window.FindName("chkOpenFolder"); $btnRun=$window.FindName("btnRun"); $progressBar=$window.FindName("progressBar")
+$chkOpenFolder=$window.FindName("chkOpenFolder"); $chkGeoLookup=$window.FindName("chkGeoLookup"); $btnRun=$window.FindName("btnRun"); $progressBar=$window.FindName("progressBar")
 $lblProgress=$window.FindName("lblProgress"); $txtLog=$window.FindName("txtLog")
 $btnCheckAll=$window.FindName("btnCheckAll"); $btnUncheckAll=$window.FindName("btnUncheckAll")
 $chkBaseline=$window.FindName("chkBaseline"); $txtBaselinePath=$window.FindName("txtBaselinePath")
@@ -423,8 +468,7 @@ $cmbMFAFilter=$window.FindName("cmbMFAFilter"); $btnRefreshMFA=$window.FindName(
 $btnExportMFA=$window.FindName("btnExportMFA")
 
 $chkSteps = @{}
-for ($i = 1; $i -le 16; $i++) { $chkSteps[$i] = $window.FindName("chkStep{0:D2}" -f $i) }
-$chkSteps[17] = $window.FindName("chkStep17")
+for ($i = 1; $i -le 18; $i++) { $chkSteps[$i] = $window.FindName("chkStep{0:D2}" -f $i) }
 
 foreach ($d in @(1, 3, 7, 14, 30)) { $item = [System.Windows.Controls.ComboBoxItem]::new(); $item.Content = "$d"; $cmbDaysBack.Items.Add($item) | Out-Null }
 $cmbDaysBack.SelectedIndex = 2
@@ -439,6 +483,17 @@ $script:allMFAData          = [System.Collections.Generic.List[PSCustomObject]]:
 $script:allMFAMethodDetails = [System.Collections.Generic.List[PSCustomObject]]::new()   # one row per registered method
 $script:allMFAAuditRows     = [System.Collections.Generic.List[PSCustomObject]]::new()   # one row per MFA audit event
 $script:MFAContext          = $null                                                      # tenant-level lookups
+
+# Sign-in IP intelligence (step 18 and the IP roll-up).
+$script:LTIIPInfo          = @{}      # IP  -> country / state / city / ASN / network name / source
+$script:LTIASNames         = @{}      # ASN -> network name (only filled by the opt-in lookup)
+$script:allIPRollup        = [System.Collections.Generic.List[PSCustomObject]]::new()   # one row per mailbox + IP, per run
+$script:LTIGeoLookup       = $false   # opt-in Team Cymru lookup, set from the checkbox at run time
+$script:LTIGeoLookupCount  = 0
+$script:LTIEntraBlocked    = $null    # why the Entra sign-in log cannot be read in this tenant, once known
+$script:LTILastPagedTruncated = $false
+$script:LTIVersion         = "REV 2.5"
+$script:LTILogReach        = $null    # result of the Entra log reach check for the current run
 
 # Microsoft Graph sign-in state
 $script:GraphClientId     = "14d82eec-204b-4c2f-b7e8-296a70dab67e"  # Microsoft Graph Command Line Tools (public client)
@@ -675,6 +730,8 @@ function Get-LTIGraphPaged {
         $next = $resp.'@odata.nextLink'
         if ($page % 3 -eq 0) { Flush-UI }
     }
+    # $true when the page cap stopped the loop with more data still available.
+    $script:LTILastPagedTruncated = [bool]$next
     return , $items.ToArray()
 }
 
@@ -854,6 +911,31 @@ function ConvertTo-LTIUtcDateTime {
     return $null
 }
 
+function Get-LTIStamp {
+    # "2026-11-21 16:36:10 UTC (11:36:10 local, UTC-05:00)"
+    # These stamps used to be Get-Date with the 'u' format, which prints LOCAL
+    # time with a Z suffix - five hours out for a US Eastern workstation.
+    param([DateTime]$When = (Get-Date))
+
+    $utc = $When.ToUniversalTime()
+    $off = [TimeZoneInfo]::Local.GetUtcOffset($When)
+    $sign = '+'
+    if ($off -lt [TimeSpan]::Zero) { $sign = '-' }
+    $abs = $off.Duration()
+    return ("{0} UTC ({1} local, UTC{2}{3:00}:{4:00})" -f $utc.ToString("yyyy-MM-dd HH:mm:ss"), $When.ToString("HH:mm:ss"), $sign, $abs.Hours, $abs.Minutes)
+}
+
+function Get-LTIAuditTime {
+    # UTC timestamp for a unified-audit-log row, in the same format as every
+    # other timeline column. Prefers AuditData.CreationTime (documented as UTC).
+    param($Row, $AuditData)
+
+    $t = $null
+    if ($AuditData) { $t = $AuditData.CreationTime }
+    if ($null -eq $t -or [string]::IsNullOrWhiteSpace([string]$t)) { $t = $Row.CreationDate }
+    return (Format-LTIDateTime -Value $t)
+}
+
 function Format-LTIDateTime {
     param([object]$Value)
 
@@ -870,42 +952,111 @@ function Format-LTIDateTime {
 #  stops the per-user MFA check, it only leaves the related columns blank)
 # -----------------------------------------------------------------------------
 function Get-GraphAuthenticationMethodAuditEvents {
-    # Entra directory audit events written by the Authentication Methods
-    # service: who registered, changed, reset or deleted security info / MFA
-    # methods, and when. Limited by audit retention (7 days on Entra ID Free,
-    # 30 days with P1/P2). ALWAYS returns an array, even when empty.
+    # Entra directory audit events for sign-in method changes: who registered,
+    # changed, reset or deleted an MFA method / key / passkey, and when.
+    # Entra spreads these over several services, so each is queried separately
+    # and a failure of one never loses the others:
+    #   Authentication Methods      - security info registered / deleted / changed
+    #   Device Registration Service - Windows Hello for Business keys, device-bound
+    #                                 passkeys, platform credentials, passwordless
+    #                                 phone sign-in, device registration
+    #   Core Directory              - legacy per-user MFA switched on / off
+    # Limited by the tenant's audit retention (7 days on Entra ID Free, 30 days
+    # with P1/P2). ALWAYS returns an array, even when empty.
     param([int]$DaysBack = 30)
 
     $events = [System.Collections.Generic.List[object]]::new()
+    $startUtc = (Get-Date).ToUniversalTime().AddDays(-1 * $DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-    try {
-        Add-Log "  Fetching MFA configuration audit events for the last $DaysBack day(s)..."
+    $queries = @(
+        @{ Name = 'Authentication Methods'; Required = $true
+           Filter = "loggedByService eq 'Authentication Methods' and activityDateTime ge $startUtc"
+           Match  = '(security info|authentication method|authenticator|phone|FIDO|passkey|Temporary Access Pass|passwordless|MFA|multifactor|strong authentication)' },
+        @{ Name = 'Device Registration Service'; Required = $false
+           Filter = "loggedByService eq 'Device Registration Service' and activityDateTime ge $startUtc"
+           Match  = '(Windows Hello|passkey|credential|register device)' },
+        @{ Name = 'Core Directory (per-user MFA off)'; Required = $false
+           Filter = "activityDisplayName eq 'Disable Strong Authentication' and activityDateTime ge $startUtc"
+           Match  = '.' },
+        @{ Name = 'Core Directory (per-user MFA on)'; Required = $false
+           Filter = "activityDisplayName eq 'Enable Strong Authentication' and activityDateTime ge $startUtc"
+           Match  = '.' }
+    )
 
-        $startUtc = (Get-Date).ToUniversalTime().AddDays(-1 * $DaysBack).ToString("yyyy-MM-ddTHH:mm:ssZ")
-        $filter = "loggedByService eq 'Authentication Methods' and activityDateTime ge $startUtc"
-        $uri = 'https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?$filter=' + [Uri]::EscapeDataString($filter)
-
-        foreach ($item in (Get-LTIGraphPaged -Uri $uri)) {
-            $activity = [string]$item.activityDisplayName
-
-            # Keep the events that normally represent MFA/security-info registration,
-            # updates, resets, deletes, or default-method changes.
-            if ($activity -match '(security info|authentication method|authenticator|phone|FIDO|passkey|Temporary Access Pass|passwordless|MFA|multifactor|strong authentication)') {
-                $events.Add($item)
+    Add-Log "  Fetching MFA / sign-in method audit events for the last $DaysBack day(s)..."
+    foreach ($q in $queries) {
+        try {
+            $uri = 'https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?$filter=' + [Uri]::EscapeDataString($q.Filter)
+            $kept = 0
+            foreach ($item in (Get-LTIGraphPaged -Uri $uri)) {
+                if ([string]$item.activityDisplayName -match $q.Match) { $events.Add($item); $kept++ }
+            }
+            Write-Log "MFA audit query '$($q.Name)': $kept event(s)"
+        } catch {
+            Write-Log "MFA audit query '$($q.Name)' failed: $_" "WARN"
+            if ($q.Required) {
+                Add-Log "  [WARN] MFA configuration audit events unavailable: $($_.Exception.Message)"
+                if ([int]$_.Exception.Data['LTIStatus'] -eq 403) {
+                    Add-Log "         Needs AuditLog.Read.All plus Reports Reader, Security Reader, Global Reader or Global Admin."
+                }
+                Add-Log "         MFA config date columns will be blank. MFA status itself is not affected."
+                # Same sign-in, same answer for the other services - do not repeat the refusal.
+                if (@(401, 403) -contains [int]$_.Exception.Data['LTIStatus']) { break }
+            } else {
+                Add-Log "  [INFO] Could not read '$($q.Name)' audit events: $($_.Exception.Message)"
             }
         }
-
-        Add-Log "  [OK] Loaded $($events.Count) MFA/security-info audit event(s)"
-    } catch {
-        Add-Log "  [WARN] MFA configuration audit events unavailable: $($_.Exception.Message)"
-        if ([int]$_.Exception.Data['LTIStatus'] -eq 403) {
-            Add-Log "         Needs AuditLog.Read.All plus Reports Reader, Security Reader, Global Reader or Global Admin."
-        }
-        Add-Log "         MFA config date columns will be blank. MFA status itself is not affected."
-        Write-Log "Get-GraphAuthenticationMethodAuditEvents failed: $_" "WARN"
     }
 
+    Add-Log "  [OK] Loaded $($events.Count) MFA / sign-in method audit event(s)"
     return , $events.ToArray()
+}
+
+function Test-LTIEntraLogReach {
+    # Does this tenant's Entra log hold ANYTHING older than 8 days?
+    #   'Yes'     - the log reaches back further than a week (P1/P2 retention)
+    #   'No'      - nothing older than a week exists: 7-day retention (Entra ID
+    #               Free, or P1/P2 added in the last few days)
+    #   'Unknown' - the check itself could not run
+    # One cheap request per log. It is what tells a 30-day run that the Entra
+    # data in it only covers 7 days.
+    param([Parameter(Mandatory = $true)][ValidateSet('SignIns', 'Audit')][string]$Log)
+
+    $now  = (Get-Date).ToUniversalTime()
+    $from = $now.AddDays(-30).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $to   = $now.AddDays(-8).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    if ($Log -eq 'SignIns') {
+        $uri = 'https://graph.microsoft.com/beta/auditLogs/signIns?$top=1&$filter=' + [Uri]::EscapeDataString("createdDateTime ge $from and createdDateTime le $to")
+    } else {
+        $uri = 'https://graph.microsoft.com/v1.0/auditLogs/directoryAudits?$top=1&$filter=' + [Uri]::EscapeDataString("activityDateTime ge $from and activityDateTime le $to")
+    }
+    try {
+        $r = Invoke-LTIGraphGet -Uri $uri
+        if (@(@($r.value) | Where-Object { $null -ne $_ }).Count -gt 0) { return 'Yes' }
+        return 'No'
+    } catch {
+        Write-Log "Entra log reach check ($Log) failed: $($_.Exception.Message)" "WARN"
+        return 'Unknown'
+    }
+}
+
+function Get-LTILogReachText {
+    # One sentence per log for the report header. Empty when the check did not run.
+    param($Reach, [int]$DaysBack)
+
+    if (-not $Reach) { return @() }
+    $lines = @()
+    foreach ($pair in @(@('SignIns', 'sign-in log (step 18)'), @('Audit', 'audit log (17b MFA changes)'))) {
+        $state = [string]$Reach[$pair[0]]
+        if ($state -eq 'No') {
+            $lines += "Entra $($pair[1]): holds NOTHING older than 7 days. Entra ID Free keeps 7 days; P1/P2 keeps 30 from the day the licence was added. Anything Entra-sourced in this report covers the last 7 days only$(if ($DaysBack -gt 7) { ", not the $DaysBack requested" })."
+        } elseif ($state -eq 'Yes') {
+            $lines += "Entra $($pair[1]): reaches back more than 7 days (up to 30)."
+        } elseif ($state) {
+            $lines += "Entra $($pair[1]): reach could not be checked."
+        }
+    }
+    return $lines
 }
 
 function Get-LTIDirectoryUserMap {
@@ -1056,6 +1207,16 @@ function Get-LTIMFAConfigAuditSummary {
             if ($lookup.ContainsKey($key)) { $matched[$lookup[$key]] = $true }
         }
 
+        # Windows Hello / passkey / device registration events are self-service and
+        # may name only the device as the target - the user is then the initiator.
+        # (Never done for Authentication Methods events, where the initiator can be
+        # an admin acting on someone else.)
+        if ($matched.Count -eq 0 -and [string]$ev.loggedByService -eq 'Device Registration Service' -and $ev.initiatedBy -and $ev.initiatedBy.user) {
+            foreach ($key in @([string]$ev.initiatedBy.user.userPrincipalName, [string]$ev.initiatedBy.user.id)) {
+                if ($key -and $lookup.ContainsKey($key.ToLowerInvariant())) { $matched[$lookup[$key.ToLowerInvariant()]] = $true }
+            }
+        }
+
         foreach ($upnLower in @($matched.Keys)) {
             if (-not $eventsByUpn.ContainsKey($upnLower)) {
                 $eventsByUpn[$upnLower] = [System.Collections.Generic.List[object]]::new()
@@ -1096,6 +1257,7 @@ function Get-LTIMFAConfigAuditSummary {
                 UPN           = $displayUpn[$upnLower]
                 Timestamp     = Format-LTIDateTime -Value $ev.activityDateTime
                 Activity      = [string]$ev.activityDisplayName
+                Service       = [string]$ev.loggedByService
                 Result        = [string]$ev.result
                 ResultReason  = [string]$ev.resultReason
                 InitiatedBy   = $actor
@@ -1572,8 +1734,8 @@ $btnBaselineBrowse.Add_Click({
 $btnBaselineClear.Add_Click({ $txtBaselinePath.Text = "" })
 
 # Button handlers
-$btnCheckAll.Add_Click({ for ($i=1;$i-le 16;$i++) { $chkSteps[$i].IsChecked=$true }; $chkSteps[17].IsChecked=$true })
-$btnUncheckAll.Add_Click({ for ($i=1;$i-le 16;$i++) { $chkSteps[$i].IsChecked=$false }; $chkSteps[17].IsChecked=$false })
+$btnCheckAll.Add_Click({ for ($i=1;$i-le 18;$i++) { $chkSteps[$i].IsChecked=$true } })
+$btnUncheckAll.Add_Click({ for ($i=1;$i-le 18;$i++) { $chkSteps[$i].IsChecked=$false } })
 $btnSelectAll.Add_Click({ $lstMailboxes.SelectAll() })
 $btnSelectNone.Add_Click({ $lstMailboxes.UnselectAll() })
 $btnBrowse.Add_Click({
@@ -1772,27 +1934,477 @@ function Get-LTIAuditIP {
     return ""
 }
 
-function Get-LTISignInIPSummary {
-    # "203.0.113.5 (41 ok / 2 failed); 198.51.100.7 (0 ok / 78 failed)" - busiest first.
-    param($SignIns, [int]$Max = 10)
+# -----------------------------------------------------------------------------
+#  SIGN-IN IP INTELLIGENCE (REV 2.4)
+#  - Entra sign-in log (interactive + non-interactive) via Microsoft Graph
+#  - Country / city / ASN per IP
+#  - One roll-up row per mailbox + IP
+# -----------------------------------------------------------------------------
+function Test-LTIPublicIP {
+    # $true for an address worth looking up: not private, loopback, link-local,
+    # carrier-grade NAT, multicast or otherwise reserved.
+    param([string]$IP)
 
-    $groups = @(@($SignIns) | Where-Object { $_ -and $_.ClientIP } | Group-Object -Property ClientIP | Sort-Object -Property Count -Descending)
-    if ($groups.Count -eq 0) { return "" }
+    $addr = $null
+    if (-not [System.Net.IPAddress]::TryParse([string]$IP, [ref]$addr)) { return $false }
+    $b = $addr.GetAddressBytes()
 
-    $parts = @($groups | Select-Object -First $Max | ForEach-Object {
-        $ok   = @($_.Group | Where-Object { $_.Operation -eq "UserLoggedIn" }).Count
-        $fail = @($_.Group | Where-Object { $_.Operation -eq "UserLoginFailed" }).Count
-        "$($_.Name) ($ok ok / $fail failed)"
+    if ($addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        if ($b[0] -eq 0 -or $b[0] -eq 10 -or $b[0] -eq 127 -or $b[0] -ge 224) { return $false }
+        if ($b[0] -eq 172 -and $b[1] -ge 16 -and $b[1] -le 31) { return $false }
+        if ($b[0] -eq 192 -and $b[1] -eq 168) { return $false }
+        if ($b[0] -eq 169 -and $b[1] -eq 254) { return $false }
+        if ($b[0] -eq 100 -and $b[1] -ge 64 -and $b[1] -le 127) { return $false }
+        return $true
+    }
+    if ($addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+        if ([System.Net.IPAddress]::IsLoopback($addr) -or $addr.IsIPv6LinkLocal -or $addr.IsIPv6SiteLocal -or $addr.IsIPv6Multicast) { return $false }
+        if (($b[0] -band 0xFE) -eq 0xFC) { return $false }     # fc00::/7 unique local
+        if (($b | Measure-Object -Sum).Sum -eq 0) { return $false }
+        return $true
+    }
+    return $false
+}
+
+function Get-LTICymruQueryName {
+    # DNS name for Team Cymru's IP-to-ASN service: reversed octets (IPv4) or
+    # reversed nibbles (IPv6) under origin.asn.cymru.com / origin6.asn.cymru.com.
+    param([string]$IP)
+
+    $addr = $null
+    if (-not [System.Net.IPAddress]::TryParse([string]$IP, [ref]$addr)) { return $null }
+    $b = $addr.GetAddressBytes()
+
+    if ($addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+        return "$($b[3]).$($b[2]).$($b[1]).$($b[0]).origin.asn.cymru.com"
+    }
+    if ($addr.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+        $nibbles = [System.Collections.Generic.List[string]]::new()
+        for ($i = $b.Length - 1; $i -ge 0; $i--) {
+            $nibbles.Add(('{0:x}' -f ($b[$i] -band 0x0F)))
+            $nibbles.Add(('{0:x}' -f (($b[$i] -shr 4) -band 0x0F)))
+        }
+        return (($nibbles -join '.') + '.origin6.asn.cymru.com')
+    }
+    return $null
+}
+
+function Resolve-LTIDnsTxt {
+    # First TXT string for a name, or $null. Never throws. One retry: a single
+    # dropped UDP answer should not leave an IP unlabelled.
+    param([string]$Name)
+
+    foreach ($attempt in 1, 2) {
+        try {
+            $r = Resolve-DnsName -Name $Name -Type TXT -DnsOnly -ErrorAction Stop | Where-Object { $_.Strings } | Select-Object -First 1
+            if ($r) { return (@($r.Strings) -join '') }
+            return $null
+        } catch {
+            if ($attempt -eq 1) { Start-Sleep -Milliseconds 300 }
+        }
+    }
+    return $null
+}
+
+function Set-LTIIPInfo {
+    # Records what is known about an IP. Microsoft's own sign-in geolocation
+    # always wins over a registry lookup; blanks never overwrite values.
+    param([string]$IP, [string]$Country, [string]$State, [string]$City, [string]$ASN, [string]$ASName, [string]$Source)
+
+    if ([string]::IsNullOrWhiteSpace($IP)) { return }
+    $info = $script:LTIIPInfo[$IP]
+    if (-not $info) {
+        $info = [PSCustomObject]@{ Country = ""; State = ""; City = ""; ASN = ""; ASName = ""; Source = "" }
+        $script:LTIIPInfo[$IP] = $info
+    }
+    $fromEntra = ($Source -eq 'Entra')
+    if ($Country -and ($fromEntra -or -not $info.Country)) {
+        $info.Country = $Country
+        $info.Source = $Source
+        if ($fromEntra) { $info.State = $State; $info.City = $City }
+    }
+    if ($ASN -and $ASN -ne '0' -and ($fromEntra -or -not $info.ASN)) { $info.ASN = $ASN }
+    if ($ASName -and -not $info.ASName -and $ASN -and $info.ASN -eq $ASN) { $info.ASName = $ASName; $script:LTIASNames[$ASN] = $ASName }
+    if (-not $info.Source) { $info.Source = $Source }
+}
+
+function Invoke-LTICymruBulkWhois {
+    # The whole list in ONE TCP connection to whois.cymru.com:43, which is how
+    # Team Cymru asks for more than a handful of addresses to be sent.
+    # Returns the raw reply, or $null when the port cannot be reached.
+    param([string[]]$IPs)
+
+    $client = $null
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $connect = $client.ConnectAsync('whois.cymru.com', 43)
+        if (-not $connect.Wait(8000)) { throw "connection timed out" }
+        $client.ReceiveTimeout = 30000
+        $client.SendTimeout = 10000
+
+        $stream = $client.GetStream()
+        $payload = "begin`nverbose`n" + ($IPs -join "`n") + "`nend`n"
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($payload)
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush()
+
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::ASCII)
+        return $reader.ReadToEnd()
+    } catch {
+        Write-Log "Team Cymru bulk whois failed: $($_.Exception.Message)" "WARN"
+        return $null
+    } finally {
+        if ($client) { try { $client.Close() } catch {} }
+    }
+}
+
+function ConvertFrom-LTICymruBulk {
+    # Bulk verbose reply -> hashtable: IP -> ASN / Country / ASName.
+    #   AS      | IP               | BGP Prefix          | CC | Registry | Allocated  | AS Name
+    #   23028   | 216.90.108.31    | 216.90.108.0/24     | US | arin     | 1998-09-25 | TEAM-CYMRU, US
+    # Addresses with no route come back as NA and are left out.
+    param([string]$Text)
+
+    $map = @{}
+    foreach ($line in @(([string]$Text) -split "`r?`n")) {
+        $f = @($line -split '\|' | ForEach-Object { $_.Trim() })
+        if ($f.Count -lt 7) { continue }
+        $asn = @($f[0] -split '\s+' | Where-Object { $_ })[0]
+        if ($asn -notmatch '^\d+$') { continue }
+
+        $addr = $null
+        if (-not [System.Net.IPAddress]::TryParse($f[1], [ref]$addr)) { continue }
+        $key = $addr.ToString()
+        if ($map.ContainsKey($key)) { continue }
+
+        $cc = $f[3]
+        if ($cc -eq 'NA') { $cc = '' }
+        $name = ($f[6] -replace ',\s*[A-Z]{2}$', '').Trim()
+        if ($name -eq 'NA') { $name = '' }
+        $map[$key] = [PSCustomObject]@{ ASN = $asn; Country = $cc; ASName = $name }
+    }
+    return $map
+}
+
+function Update-LTIIPInfoFromCymru {
+    # OPT-IN (checkbox on the main window). Fills in ASN, network name and
+    # country for IPs Microsoft did not label, using Team Cymru's public
+    # IP-to-ASN service. This sends those IP addresses to a third party.
+    # The country returned is where the address block is REGISTERED, which is
+    # often not where the device is - Entra's geolocation is always preferred.
+    #
+    # Called once per run with every IP, so there is one bulk connection rather
+    # than a query per address. If TCP 43 is blocked it falls back to DNS.
+    param([string[]]$IPs)
+
+    if (-not $script:LTIGeoLookup) { return }
+
+    $all  = @($IPs | Where-Object { $_ } | Select-Object -Unique)
+    $need = @($all | Where-Object {
+        $i = $script:LTIIPInfo[$_]
+        ((-not $i) -or (-not $i.ASN) -or (-not $i.Country)) -and (Test-LTIPublicIP -IP $_)
+    })
+
+    if ($need.Count -gt 0) {
+        Add-Log "  ASN lookup: $($need.Count) unlabelled public IP(s) -> Team Cymru bulk whois..."
+        Flush-UI
+        $bulkWorked = $false
+        for ($offset = 0; $offset -lt $need.Count; $offset += 2000) {
+            $chunk = @($need | Select-Object -Skip $offset -First 2000)
+            $raw = Invoke-LTICymruBulkWhois -IPs $chunk
+            if (-not $raw) { continue }
+            $bulkWorked = $true
+            $answers = ConvertFrom-LTICymruBulk -Text $raw
+            foreach ($ip in $chunk) {
+                $addr = $null
+                if (-not [System.Net.IPAddress]::TryParse($ip, [ref]$addr)) { continue }
+                $a = $answers[$addr.ToString()]
+                if ($a) { Set-LTIIPInfo -IP $ip -Country $a.Country -ASN $a.ASN -ASName $a.ASName -Source 'Team Cymru (registered country)' }
+            }
+            Flush-UI
+        }
+
+        if (-not $bulkWorked) {
+            Add-Log "  [WARN] Bulk whois (TCP 43 to whois.cymru.com) could not be reached - using DNS lookups instead (slower)."
+            $done = 0
+            foreach ($ip in @($need | Select-Object -First 1000)) {
+                $done++
+                $name = Get-LTICymruQueryName -IP $ip
+                $txt = $null
+                if ($name) { $txt = Resolve-LTIDnsTxt -Name $name }
+                if ($txt) {
+                    # "23028 | 216.90.108.0/24 | US | arin | 1998-09-25"
+                    $f = @($txt -split '\|' | ForEach-Object { $_.Trim() })
+                    if ($f.Count -ge 3) {
+                        $asn = @($f[0] -split '\s+' | Where-Object { $_ })[0]
+                        Set-LTIIPInfo -IP $ip -Country $f[2] -ASN $asn -Source 'Team Cymru (registered country)'
+                    }
+                }
+                if ($done % 10 -eq 0) { $lblProgress.Text = "ASN lookup: $done / $($need.Count)"; Flush-UI }
+            }
+            if ($need.Count -gt 1000) { Add-Log "  [WARN] DNS fallback is limited to 1000 IPs per run - $($need.Count - 1000) not looked up." }
+        }
+
+        $unanswered = @($need | Where-Object { $i = $script:LTIIPInfo[$_]; (-not $i) -or (-not $i.ASN) })
+        Add-Log "  ASN lookup: labelled $($need.Count - $unanswered.Count) of $($need.Count) IP(s)$(if ($unanswered.Count -gt 0) { " - $($unanswered.Count) had no answer and stay unlabelled" })"
+    }
+
+    # Network names for ASNs that still have none (ASNs from Entra, or from the
+    # DNS fallback). Only the AS number is sent, once per distinct ASN.
+    foreach ($ip in $all) {
+        $info = $script:LTIIPInfo[$ip]
+        if ($info -and $info.ASN -and -not $info.ASName) {
+            if (-not $script:LTIASNames.ContainsKey($info.ASN)) {
+                $nameTxt = Resolve-LTIDnsTxt -Name "AS$($info.ASN).asn.cymru.com"
+                $asName = ""
+                if ($nameTxt) {
+                    # "23028 | US | arin | 2002-01-04 | TEAM-CYMRU, US"
+                    $nf = @($nameTxt -split '\|' | ForEach-Object { $_.Trim() })
+                    if ($nf.Count -ge 5) { $asName = ($nf[4] -replace ',\s*[A-Z]{2}$', '').Trim() }
+                }
+                $script:LTIASNames[$info.ASN] = $asName
+            }
+            $info.ASName = $script:LTIASNames[$info.ASN]
+        }
+    }
+}
+
+function Update-LTIRollupGeo {
+    # Runs once, after every mailbox has been processed: one lookup for every
+    # unlabelled IP in the run, then the labels in the roll-up rows and in each
+    # mailbox's findings are refreshed.
+    param($Findings)
+
+    if ($script:allIPRollup.Count -eq 0) { return }
+    Update-LTIIPInfoFromCymru -IPs @($script:allIPRollup | ForEach-Object { $_.IP })
+
+    foreach ($row in $script:allIPRollup) {
+        $info = $script:LTIIPInfo[$row.IP]
+        if (-not $info) { continue }
+        $row.Country = $info.Country; $row.State = $info.State; $row.City = $info.City
+        $row.ASN = $info.ASN; $row.ASName = $info.ASName; $row.GeoSource = $info.Source
+    }
+
+    foreach ($f in @($Findings)) {
+        if ($null -eq $f) { continue }
+        $rows = @($script:allIPRollup | Where-Object { $_.UPN -eq $f.UPN })
+        if ($rows.Count -eq 0) { continue }
+        $f.SignInIPs         = Get-LTIIPSummaryText -Rows $rows -OkProperty 'AuditOK' -FailedProperty 'AuditFailed'
+        $f.NonInteractiveIPs = Get-LTIIPSummaryText -Rows $rows -OkProperty 'NonInteractiveOK' -FailedProperty 'NonInteractiveFailed'
+        $countries = Get-LTICountrySummary -Rows $rows
+        $f.SignInCountries   = $countries.Text
+        $f.CountryCount      = $countries.Count
+    }
+}
+
+function Get-LTIIPLabel {
+    # "[US AS7922 COMCAST-7922]" - whatever of country / ASN / network name is known.
+    param([string]$IP)
+
+    $info = $script:LTIIPInfo[$IP]
+    if (-not $info) { return "" }
+    $parts = @()
+    if ($info.Country) { $parts += $info.Country }
+    if ($info.ASN)     { $parts += "AS$($info.ASN)" }
+    if ($info.ASName)  { $parts += $info.ASName }
+    if ($parts.Count -eq 0) { return "" }
+    return "[" + ($parts -join " ") + "]"
+}
+
+function Get-LTIEntraSignIns {
+    # Entra sign-in log for one user: interactive AND non-interactive (token
+    # refreshes, background app sign-ins - where a stolen session token shows up).
+    # Non-interactive sign-ins only exist on Graph's beta endpoint. Microsoft
+    # only serves this log to tenants with Entra ID P1/P2, and keeps 30 days.
+    #
+    # Returns: Rows (flat, CSV-ready), Truncated ($true if the page cap was hit),
+    #          Note (set when the non-interactive half failed).
+    # Throws when the log cannot be read at all.
+    param(
+        [Parameter(Mandatory = $true)][string]$UPN,
+        [Parameter(Mandatory = $true)][DateTime]$Start,
+        [Parameter(Mandatory = $true)][DateTime]$End,
+        [int]$MaxPages = 25
+    )
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+    $truncated = $false
+    $note = ""
+
+    $from = $Start.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $to   = $End.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+    # Filter on the object ID when the MFA step has already loaded the directory.
+    $who = "userPrincipalName eq '" + $UPN.ToLowerInvariant().Replace("'", "''") + "'"
+    if ($script:MFAContext -and $script:MFAContext.DirectoryByUpn) {
+        $dir = $script:MFAContext.DirectoryByUpn[$UPN.ToLowerInvariant()]
+        if ($dir -and $dir.id) { $who = "userId eq '$($dir.id)'" }
+    }
+
+    foreach ($type in @('interactiveUser', 'nonInteractiveUser')) {
+        $label = 'Interactive'
+        if ($type -eq 'nonInteractiveUser') { $label = 'NonInteractive' }
+
+        $filter = "$who and createdDateTime ge $from and createdDateTime le $to and signInEventTypes/any(t: t eq '$type')"
+        $uri = 'https://graph.microsoft.com/beta/auditLogs/signIns?$filter=' + [Uri]::EscapeDataString($filter)
+
+        $items = @()
+        try {
+            $items = Get-LTIGraphPaged -Uri $uri -MaxPages $MaxPages
+            if ($script:LTILastPagedTruncated) { $truncated = $true }
+        } catch {
+            if ($type -eq 'interactiveUser') { throw }
+            $note = "non-interactive sign-ins unavailable: $($_.Exception.Message)"
+            Write-Log "Entra non-interactive sign-ins failed for ${UPN}: $($_.Exception.Message)" "WARN"
+            continue
+        }
+
+        foreach ($s in $items) {
+            $code = 0
+            if ($s.status -and $null -ne $s.status.errorCode) { $code = [int]$s.status.errorCode }
+            $result = 'Success'
+            if ($code -ne 0) { $result = 'Failure' }
+
+            $ip = ([string]$s.ipAddress).Trim()
+            $country = ""; $state = ""; $city = ""
+            if ($s.location) { $country = [string]$s.location.countryOrRegion; $state = [string]$s.location.state; $city = [string]$s.location.city }
+            $asn = ""
+            if ($null -ne $s.autonomousSystemNumber -and [string]$s.autonomousSystemNumber -ne '0') { $asn = [string]$s.autonomousSystemNumber }
+            Set-LTIIPInfo -IP $ip -Country $country -State $state -City $city -ASN $asn -Source 'Entra'
+
+            $dd = $s.deviceDetail
+            $rows.Add([PSCustomObject]@{
+                Timestamp         = Format-LTIDateTime -Value $s.createdDateTime
+                Type              = $label
+                Result            = $result
+                ErrorCode         = $code
+                FailureReason     = [string]$s.status.failureReason
+                IP                = $ip
+                Country           = $country
+                State             = $state
+                City              = $city
+                ASN               = $asn
+                App               = [string]$s.appDisplayName
+                Resource          = [string]$s.resourceDisplayName
+                ClientApp         = [string]$s.clientAppUsed
+                DeviceOS          = [string]$dd.operatingSystem
+                Browser           = [string]$dd.browser
+                DeviceName        = [string]$dd.displayName
+                DeviceTrust       = [string]$dd.trustType
+                DeviceCompliant   = [string]$dd.isCompliant
+                DeviceManaged     = [string]$dd.isManaged
+                ConditionalAccess = [string]$s.conditionalAccessStatus
+                AuthRequirement   = [string]$s.authenticationRequirement
+                TokenType         = [string]$s.incomingTokenType
+                RiskLevel         = [string]$s.riskLevelDuringSignIn
+                UserAgent         = [string]$s.userAgent
+                CorrelationId     = [string]$s.correlationId
+            })
+        }
+        Flush-UI
+    }
+
+    return [PSCustomObject]@{ Rows = $rows; Truncated = $truncated; Note = $note }
+}
+
+function Get-LTIIPRollup {
+    # One row per IP for a mailbox, combining the unified audit log sign-ins
+    # (step 1) with the Entra sign-in log (step 18). The two logs overlap for
+    # interactive sign-ins, so their counts are kept in separate columns and
+    # must not be added together.
+    param([string]$UPN, $AuditSignIns, $EntraSignIns)
+
+    $map = [ordered]@{}
+    $touch = {
+        param($ip, $counter, $when)
+        if ([string]::IsNullOrWhiteSpace($ip)) { return }
+        if (-not $map.Contains($ip)) {
+            $map[$ip] = [PSCustomObject]@{ AuditOK = 0; AuditFailed = 0; InteractiveOK = 0; InteractiveFailed = 0; NonInteractiveOK = 0; NonInteractiveFailed = 0; First = $null; Last = $null }
+        }
+        $e = $map[$ip]
+        if ($counter) { $e.$counter++ }
+        $t = ConvertTo-LTIUtcDateTime -Value $when
+        if ($null -ne $t) {
+            if ($null -eq $e.First -or $t -lt $e.First) { $e.First = $t }
+            if ($null -eq $e.Last  -or $t -gt $e.Last)  { $e.Last  = $t }
+        }
+    }
+
+    foreach ($r in @($AuditSignIns)) {
+        if ($null -eq $r) { continue }
+        $counter = $null
+        if ($r.Operation -eq 'UserLoggedIn') { $counter = 'AuditOK' } elseif ($r.Operation -eq 'UserLoginFailed') { $counter = 'AuditFailed' }
+        & $touch ([string]$r.ClientIP) $counter $r.Timestamp
+    }
+    foreach ($r in @($EntraSignIns)) {
+        if ($null -eq $r) { continue }
+        $counter = $r.Type + 'OK'
+        if ($r.Result -ne 'Success') { $counter = $r.Type + 'Failed' }
+        & $touch ([string]$r.IP) $counter $r.Timestamp
+    }
+
+    $out = foreach ($ip in @($map.Keys)) {
+        $e = $map[$ip]
+        $info = $script:LTIIPInfo[$ip]
+        [PSCustomObject]@{
+            UPN                  = $UPN
+            IP                   = $ip
+            Country              = $(if ($info) { $info.Country } else { "" })
+            State                = $(if ($info) { $info.State } else { "" })
+            City                 = $(if ($info) { $info.City } else { "" })
+            ASN                  = $(if ($info) { $info.ASN } else { "" })
+            ASName               = $(if ($info) { $info.ASName } else { "" })
+            GeoSource            = $(if ($info) { $info.Source } else { "" })
+            AuditOK              = $e.AuditOK
+            AuditFailed          = $e.AuditFailed
+            InteractiveOK        = $e.InteractiveOK
+            InteractiveFailed    = $e.InteractiveFailed
+            NonInteractiveOK     = $e.NonInteractiveOK
+            NonInteractiveFailed = $e.NonInteractiveFailed
+            FirstSeen            = Format-LTIDateTime -Value $e.First
+            LastSeen             = Format-LTIDateTime -Value $e.Last
+        }
+    }
+    return , @($out)
+}
+
+function Get-LTIIPSummaryText {
+    # "203.0.113.5 [US AS7922 COMCAST-7922] (41 ok / 2 failed); ..." - busiest first.
+    param($Rows, [string]$OkProperty, [string]$FailedProperty, [int]$Max = 10)
+
+    $use = @(@($Rows) | Where-Object { $_ -and (($_.$OkProperty + $_.$FailedProperty) -gt 0) } |
+        Sort-Object -Property @{ Expression = { $_.$OkProperty + $_.$FailedProperty }; Descending = $true }, @{ Expression = { $_.IP } })
+    if ($use.Count -eq 0) { return "" }
+
+    $parts = @($use | Select-Object -First $Max | ForEach-Object {
+        $label = Get-LTIIPLabel -IP $_.IP
+        if ($label) { $label = " $label" }
+        "$($_.IP)$label ($($_.$OkProperty) ok / $($_.$FailedProperty) failed)"
     })
     $text = $parts -join "; "
-    if ($groups.Count -gt $Max) { $text += "; +$($groups.Count - $Max) more" }
+    if ($use.Count -gt $Max) { $text += "; +$($use.Count - $Max) more" }
     return $text
+}
+
+function Get-LTICountrySummary {
+    # "US (4 IPs), NG (1 IP)" - counts distinct IPs, so it reads the same whichever
+    # log the sign-ins came from. Returns Text and Count (countries seen).
+    param($Rows)
+
+    $known = @(@($Rows) | Where-Object { $_ -and $_.Country })
+    if ($known.Count -eq 0) { return [PSCustomObject]@{ Text = ""; Count = 0 } }
+
+    $groups = @($known | Group-Object -Property Country | Sort-Object -Property @{ Expression = 'Count'; Descending = $true }, @{ Expression = 'Name' })
+    $parts = @($groups | ForEach-Object { "$($_.Name) ($($_.Count) IP$(if ($_.Count -ne 1) { 's' }))" })
+    $unknown = @(@($Rows) | Where-Object { $_ -and -not $_.Country }).Count
+    if ($unknown -gt 0) { $parts += "unlabelled ($unknown IP$(if ($unknown -ne 1) { 's' }))" }
+    return [PSCustomObject]@{ Text = ($parts -join ", "); Count = $groups.Count }
 }
 
 function Export-ResultSet { param([string]$Name,[string]$FileName,[string]$OutFolder,$Data)
     $fp=Join-Path $OutFolder $FileName
     if ($null -eq $Data -or ($Data -is [System.Collections.IEnumerable] -and @($Data).Count -eq 0)) {
-        $ep=$fp -replace '\.csv$','_EMPTY.txt'; ("NO DATA FOUND - " + (Get-Date -Format 'u'))|Out-File -FilePath $ep -Encoding UTF8; Add-Log "  [WARN] No data: $Name"; return 0 }
+        $ep=$fp -replace '\.csv$','_EMPTY.txt'; ("NO DATA FOUND - " + (Get-LTIStamp))|Out-File -FilePath $ep -Encoding UTF8; Add-Log "  [WARN] No data: $Name"; return 0 }
     if ($Data -is [string]) { $tp=$fp -replace '\.csv$','.txt'; $Data|Out-File -FilePath $tp -Encoding UTF8; Add-Log "  [OK] $Name - 1 record -> $FileName"; return 1 }
     else { $c=@($Data).Count; @($Data)|Export-Csv -Path $fp -NoTypeInformation -Encoding UTF8; Add-Log "  [OK] $Name - $c record(s) -> $FileName"; return $c }
 }
@@ -1916,7 +2528,7 @@ function Invoke-BaselineComparison {
     $report.Add("=" * 60)
     $report.Add("Baseline : $BaselineUserFolder")
     $report.Add("Current  : $CurrentUserFolder")
-    $report.Add("Generated: $(Get-Date -Format 'u')")
+    $report.Add("Generated: $(Get-LTIStamp)")
     $report.Add("")
 
     $totalChanges = 0
@@ -2019,10 +2631,11 @@ function Invoke-BaselineComparison {
 # -----------------------------------------------------------------------------
 function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[DateTime]$EndDate,[string]$OutputFolder,[hashtable]$EnabledSteps)
     if (-not (Test-Path $OutputFolder)) { New-Item -ItemType Directory -Path $OutputFolder -Force | Out-Null }
-    $findings=[PSCustomObject]@{UPN=$UPN;DisplayName="";SignInsOK=0;SignInsFailed=0;UniqueIPs=0;SignInIPs="";ForwardingActive=$false;ForwardingTarget="";SuspiciousRules=0;TotalRules=0;OAuthConsents=0;AdminActions=0;FileEvents=0;OutboundMail=0;AuditEnabled=$null;MFAStatus="NotChecked";MFAMethods="";NewMFAMethods=0;AccountEnabled="";Errors=[System.Collections.Generic.List[string]]::new()}
+    $findings=[PSCustomObject]@{UPN=$UPN;DisplayName="";SignInsOK=0;SignInsFailed=0;UniqueIPs=0;SignInIPs="";SignInCountries="";CountryCount=0;EntraSignInLog="Not run";EntraInteractive="";EntraNonInteractive="";NonInteractiveIPs="";ForwardingActive=$false;ForwardingTarget="";SuspiciousRules=0;TotalRules=0;OAuthConsents=0;AdminActions=0;FileEvents=0;OutboundMail=0;AuditEnabled=$null;MFAStatus="NotChecked";MFAMethods="";NewMFAMethods=0;AccountEnabled="";Errors=[System.Collections.Generic.List[string]]::new()}
     # AuditEnabled stays $null and MFAStatus stays "NotChecked" until the relevant check
     # actually runs, so a skipped or failed check is never reported as "off".
 
+    $auditSignIns=@(); $entraSignIns=@()   # kept for the IP roll-up at the end
     Add-Log "Verifying mailbox: $UPN"; Flush-UI
     try { $mbx=Get-Mailbox -Identity $UPN -ErrorAction Stop; $findings.DisplayName=$mbx.DisplayName; Add-Log "  [OK] Mailbox: $($mbx.DisplayName) [$($mbx.PrimarySmtpAddress)]" }
     catch { Add-Log "  [ERROR] Not found: $_"; $findings.Errors.Add("Not found: $_"); return $findings }
@@ -2030,12 +2643,11 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[1]) { Add-Log "======================================================================"; Add-Log "  1. Sign-In and Authentication Events"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("UserLoggedIn","UserLoginFailed","ForeignRealmIndexLogonInitialAuthUsingADFSFederatedToken","PasswordLogonInitialAuthUsingPassword")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;ResultStatus=$a.ResultStatus;LogonError=$a.LogonError;ErrorCode=$(if($null -ne $a.ErrorCode -and "$($a.ErrorCode)" -ne ''){$a.ErrorCode}else{$a.ErrorNumber});ClientIP=(Get-LTIAuditIP $a);UserAgent=$a.ExtendedProperties|Where-Object{$_.Name -eq "UserAgent"}|Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue;RequestType=$a.ExtendedProperties|Where-Object{$_.Name -eq "RequestType"}|Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue;Application=$a.ApplicationId;Workload=$a.Workload}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=(Get-LTIAuditTime $_ $a);Operation=$a.Operation;ResultStatus=$a.ResultStatus;LogonError=$a.LogonError;ErrorCode=$(if($null -ne $a.ErrorCode -and "$($a.ErrorCode)" -ne ''){$a.ErrorCode}else{$a.ErrorNumber});ClientIP=(Get-LTIAuditIP $a);UserAgent=$a.ExtendedProperties|Where-Object{$_.Name -eq "UserAgent"}|Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue;RequestType=$a.ExtendedProperties|Where-Object{$_.Name -eq "RequestType"}|Select-Object -ExpandProperty Value -ErrorAction SilentlyContinue;Application=$a.ApplicationId;Workload=$a.Workload}}
             Export-ResultSet -Name "Sign-In Events" -FileName "01_SignIn_Events.csv" -OutFolder $OutputFolder -Data $parsed
             $findings.SignInsOK=@($parsed|Where-Object{$_.Operation -eq "UserLoggedIn"}).Count; $findings.SignInsFailed=@($parsed|Where-Object{$_.Operation -eq "UserLoginFailed"}).Count; $findings.UniqueIPs=@($parsed|Where-Object{$_.ClientIP}|Select-Object -ExpandProperty ClientIP -Unique).Count
-            $findings.SignInIPs=Get-LTISignInIPSummary -SignIns $parsed
+            $auditSignIns=@($parsed|Where-Object{$_})
             Add-Log "  Sign-ins: $($findings.SignInsOK) ok, $($findings.SignInsFailed) failed, $($findings.UniqueIPs) IPs"
-            if($findings.SignInIPs){Add-Log "  IPs: $($findings.SignInIPs)"}
             if(($findings.SignInsOK + $findings.SignInsFailed) -gt 0 -and $findings.UniqueIPs -eq 0){Add-Log "  [WARN] $($findings.SignInsOK + $findings.SignInsFailed) sign-in record(s) came back with no IP address in ClientIP or ActorIpAddress. Check the Entra sign-in log for this user."}
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("Sign-ins: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 1" }
@@ -2043,7 +2655,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[2]) { Add-Log "======================================================================"; Add-Log "  2. Mailbox Activity"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("MailboxLogin","MailItemsAccessed","Send","SendAs","SendOnBehalf","Create","HardDelete","SoftDelete","MoveToDeletedItems","Update","Copy","Move")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops -RecordTypes @("ExchangeItem","ExchangeItemAggregated")
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;ClientIP=(Get-LTIAuditIP $a);ClientInfo=$a.ClientInfoString;ItemSubject=$a.Item.Subject;Folder=$a.Item.ParentFolder.Path;ResultStatus=$a.ResultStatus}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=(Get-LTIAuditTime $_ $a);Operation=$a.Operation;ClientIP=(Get-LTIAuditIP $a);ClientInfo=$a.ClientInfoString;ItemSubject=$a.Item.Subject;Folder=$a.Item.ParentFolder.Path;ResultStatus=$a.ResultStatus}}
             Export-ResultSet -Name "Mailbox Activity" -FileName "02_Mailbox_Activity.csv" -OutFolder $OutputFolder -Data $parsed
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("Mailbox: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 2" }
@@ -2090,7 +2702,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[9]) { Add-Log "======================================================================"; Add-Log "  9. OAuth / App Consent"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("Consent to application.","Add OAuth2PermissionGrant.","Add app role assignment grant to user.","Add delegated permission grant.","Add application.")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops -RecordTypes @("AzureActiveDirectory")
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Target=($a.Target|ForEach-Object{$_.Id}) -join '; ';ModifiedProps=($a.ModifiedProperties|ForEach-Object{"$($_.Name)=$($_.NewValue)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a);ResultStatus=$a.ResultStatus;ActorUPN=$a.UserId}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=(Get-LTIAuditTime $_ $a);Operation=$a.Operation;Target=($a.Target|ForEach-Object{$_.Id}) -join '; ';ModifiedProps=($a.ModifiedProperties|ForEach-Object{"$($_.Name)=$($_.NewValue)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a);ResultStatus=$a.ResultStatus;ActorUPN=$a.UserId}}
             Export-ResultSet -Name "OAuth" -FileName "09_OAuth_App_Consent.csv" -OutFolder $OutputFolder -Data $parsed; $findings.OAuthConsents=@($parsed).Count
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("OAuth: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 9" }
@@ -2098,7 +2710,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[10]) { Add-Log "======================================================================"; Add-Log "  10. Rule Changes"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("New-InboxRule","Set-InboxRule","Enable-InboxRule","Remove-InboxRule","UpdateInboxRules","New-TransportRule","Set-TransportRule")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a);SessionId=$a.SessionId}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=(Get-LTIAuditTime $_ $a);Operation=$a.Operation;Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a);SessionId=$a.SessionId}}
             Export-ResultSet -Name "Rule Changes" -FileName "10_Rule_Changes.csv" -OutFolder $OutputFolder -Data $parsed
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("RuleChg: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 10" }
@@ -2106,7 +2718,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[11]) { Add-Log "======================================================================"; Add-Log "  11. File Activity"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("FileDownloaded","FileUploaded","FileDeleted","FileModified","FileRenamed","FileMoved","FileCopied","SharingSet","AnonymousLinkCreated","CompanyLinkCreated","SharingInvitationCreated","AddedToSecureLink")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops -RecordTypes @("SharePointFileOperation")
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;FileName=$a.SourceFileName;FileUrl=$a.ObjectId;SiteUrl=$a.SiteUrl;ClientIP=(Get-LTIAuditIP $a);UserAgent=$a.UserAgent}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=(Get-LTIAuditTime $_ $a);Operation=$a.Operation;FileName=$a.SourceFileName;FileUrl=$a.ObjectId;SiteUrl=$a.SiteUrl;ClientIP=(Get-LTIAuditIP $a);UserAgent=$a.UserAgent}}
             Export-ResultSet -Name "File Activity" -FileName "11_File_Activity.csv" -OutFolder $OutputFolder -Data $parsed; $findings.FileEvents=@($parsed).Count
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("Files: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 11" }
@@ -2114,7 +2726,7 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[12]) { Add-Log "======================================================================"; Add-Log "  12. Admin Actions"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("Add member to role.","Add user.","Reset user password.","Set force change user password.","Update user.","Delete user.","Set-Mailbox","Add-MailboxPermission","Remove-MailboxPermission","New-ManagementRoleAssignment")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Target=($a.Target|ForEach-Object{$_.Id}) -join '; ';Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a);ResultStatus=$a.ResultStatus}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=(Get-LTIAuditTime $_ $a);Operation=$a.Operation;Target=($a.Target|ForEach-Object{$_.Id}) -join '; ';Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a);ResultStatus=$a.ResultStatus}}
             Export-ResultSet -Name "Admin Actions" -FileName "12_Admin_Actions.csv" -OutFolder $OutputFolder -Data $parsed; $findings.AdminActions=@($parsed).Count
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("Admin: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 12" }
@@ -2122,16 +2734,16 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
     if ($EnabledSteps[13]) { Add-Log "======================================================================"; Add-Log "  13. eDiscovery"; Add-Log "======================================================================"; Flush-UI
         try { $ops=@("SearchStarted","SearchExportDownloaded","New-ComplianceSearch","New-ComplianceSearchAction","CaseAdded")
             $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN -Operations $ops
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;Operation=$a.Operation;Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a)}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=(Get-LTIAuditTime $_ $a);Operation=$a.Operation;Parameters=($a.Parameters|ForEach-Object{"$($_.Name)=$($_.Value)"}) -join '; ';ClientIP=(Get-LTIAuditIP $a)}}
             Export-ResultSet -Name "eDiscovery" -FileName "13_eDiscovery_Activity.csv" -OutFolder $OutputFolder -Data $parsed
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("eDisc: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 13" }
 
     if ($EnabledSteps[14]) { Add-Log "======================================================================"; Add-Log "  14. Message Trace"; Add-Log "======================================================================"; Flush-UI
         try { Add-Log "  Outbound..."; Flush-UI; $ob=Get-MessageTraceV2All -SenderAddress $UPN -Start $StartDate -End $EndDate
-            $obs=$ob|Select-Object Received,SenderAddress,RecipientAddress,Subject,Status,@{N='FromIP';E={$_.FromIP}},Size,MessageId; Export-ResultSet -Name "Outbound" -FileName "14a_MessageTrace_Outbound.csv" -OutFolder $OutputFolder -Data $obs; $findings.OutboundMail=@($ob).Count
+            $obs=$ob|Select-Object @{N='Received';E={Format-LTIDateTime $_.Received}},SenderAddress,RecipientAddress,Subject,Status,@{N='FromIP';E={$_.FromIP}},Size,MessageId; Export-ResultSet -Name "Outbound" -FileName "14a_MessageTrace_Outbound.csv" -OutFolder $OutputFolder -Data $obs; $findings.OutboundMail=@($ob).Count
             Add-Log "  Inbound..."; Flush-UI; $ib=Get-MessageTraceV2All -RecipientAddress $UPN -Start $StartDate -End $EndDate
-            $ibs=$ib|Select-Object Received,SenderAddress,RecipientAddress,Subject,Status,@{N='FromIP';E={$_.FromIP}},Size,MessageId; Export-ResultSet -Name "Inbound" -FileName "14b_MessageTrace_Inbound.csv" -OutFolder $OutputFolder -Data $ibs
+            $ibs=$ib|Select-Object @{N='Received';E={Format-LTIDateTime $_.Received}},SenderAddress,RecipientAddress,Subject,Status,@{N='FromIP';E={$_.FromIP}},Size,MessageId; Export-ResultSet -Name "Inbound" -FileName "14b_MessageTrace_Inbound.csv" -OutFolder $OutputFolder -Data $ibs
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("Trace: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 14" }
 
@@ -2144,10 +2756,78 @@ function Invoke-MailboxInvestigation { param([string]$UPN,[DateTime]$StartDate,[
 
     if ($EnabledSteps[16]) { Add-Log "======================================================================"; Add-Log "  16. Catch-All Audit"; Add-Log "======================================================================"; Add-Log "  Pulling ALL records..."; Flush-UI
         try { $raw=Search-UnifiedAuditLogAll -Start $StartDate -End $EndDate -UserIds $UPN
-            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=$_.CreationDate;RecordType=$_.RecordType;Operation=$a.Operation;Workload=$a.Workload;ClientIP=(Get-LTIAuditIP $a);ResultStatus=$a.ResultStatus;ObjectId=$a.ObjectId}}
+            $parsed=$raw|ForEach-Object{$a=$_|Select-Object -ExpandProperty AuditData|ConvertFrom-Json;[PSCustomObject]@{Timestamp=(Get-LTIAuditTime $_ $a);RecordType=$_.RecordType;Operation=$a.Operation;Workload=$a.Workload;ClientIP=(Get-LTIAuditIP $a);ResultStatus=$a.ResultStatus;ObjectId=$a.ObjectId}}
             Export-ResultSet -Name "All Audit" -FileName "16_All_Audit_Activity.csv" -OutFolder $OutputFolder -Data $parsed
         } catch { Add-Log "  [ERROR] $_"; $findings.Errors.Add("CatchAll: $_") }; Flush-UI
     } else { Add-Log "  [SKIP] Step 16" }
+
+    if ($EnabledSteps[18]) { Add-Log "======================================================================"; Add-Log "  18. Entra Sign-In Log (interactive + non-interactive)"; Add-Log "======================================================================"
+        if ($script:LTIEntraBlocked) {
+            # Already refused once in this run for a tenant-wide reason - do not repeat the call per mailbox.
+            $findings.EntraSignInLog = "Unavailable - $($script:LTIEntraBlocked)"
+            Add-Log "  [SKIP] $($script:LTIEntraBlocked)"
+        } elseif (-not (Test-LTIGraphToken)) {
+            $findings.EntraSignInLog = "Not checked - no Graph sign-in"
+            Add-Log "  [SKIP] No Graph sign-in. Click 'Refresh MFA' and sign in before running to include this step."
+        } else {
+            try {
+                $entra = Get-LTIEntraSignIns -UPN $UPN -Start $StartDate -End $EndDate
+                $entraSignIns = @($entra.Rows)
+                Export-ResultSet -Name "Entra Sign-Ins" -FileName "18_Entra_SignIns.csv" -OutFolder $OutputFolder -Data $entraSignIns
+                $iOK = @($entraSignIns | Where-Object { $_.Type -eq 'Interactive' -and $_.Result -eq 'Success' }).Count
+                $iNo = @($entraSignIns | Where-Object { $_.Type -eq 'Interactive' -and $_.Result -ne 'Success' }).Count
+                $nOK = @($entraSignIns | Where-Object { $_.Type -eq 'NonInteractive' -and $_.Result -eq 'Success' }).Count
+                $nNo = @($entraSignIns | Where-Object { $_.Type -eq 'NonInteractive' -and $_.Result -ne 'Success' }).Count
+                $findings.EntraInteractive = "$iOK ok / $iNo failed"
+                $findings.EntraSignInLog = "OK"
+                $reachNote = ""
+                if ($script:LTILogReach -and $script:LTILogReach.SignIns -eq 'No') { $reachNote = " - tenant log only holds the last 7 days"; $findings.EntraSignInLog += $reachNote }
+                if ($entra.Note) {
+                    $findings.EntraSignInLog = "Partial - $($entra.Note)$reachNote"
+                    Add-Log "  [WARN] $($entra.Note)"
+                } else {
+                    $findings.EntraNonInteractive = "$nOK ok / $nNo failed"
+                }
+                if ($entra.Truncated) {
+                    $findings.EntraSignInLog += " (truncated - newest $($entraSignIns.Count) kept)"
+                    Add-Log "  [WARN] Very busy account: only the newest $($entraSignIns.Count) sign-ins were retrieved."
+                }
+                Add-Log "  Interactive: $($findings.EntraInteractive) | Non-interactive: $(if($findings.EntraNonInteractive){$findings.EntraNonInteractive}else{'not available'})"
+            } catch {
+                $status = [int]$_.Exception.Data['LTIStatus']
+                $msg = [string]$_.Exception.Message
+                if ($msg -match 'NonPremium|premium license') {
+                    $script:LTIEntraBlocked = "this tenant has no Entra ID P1/P2 licence, so Microsoft does not serve its sign-in log over Graph"
+                } elseif ($status -ge 400 -and $status -lt 500) {
+                    # A refusal here is about the sign-in or the tenant, not this mailbox.
+                    $script:LTIEntraBlocked = "Graph refused the sign-in log request ($msg)"
+                    if ($status -eq 403) { $script:LTIEntraBlocked += " - needs Global Reader, Reports Reader, Security Reader or Global Admin" }
+                    $findings.Errors.Add("Entra sign-ins: $msg")
+                } else {
+                    $findings.Errors.Add("Entra sign-ins: $msg")
+                }
+                if ($script:LTIEntraBlocked) { $findings.EntraSignInLog = "Unavailable - $($script:LTIEntraBlocked)"; Add-Log "  [INFO] Entra sign-in log unavailable: $($script:LTIEntraBlocked)" }
+                else { $findings.EntraSignInLog = "Error - $msg"; Add-Log "  [ERROR] $msg" }
+            }
+        }
+        Flush-UI
+    } else { Add-Log "  [SKIP] Step 18" }
+
+    # Sign-in IP roll-up: every IP this mailbox signed in from, across both logs,
+    # labelled with country / ASN where known.
+    $ipRows = Get-LTIIPRollup -UPN $UPN -AuditSignIns $auditSignIns -EntraSignIns $entraSignIns
+    if ($ipRows.Count -gt 0) {
+        foreach ($row in $ipRows) { $script:allIPRollup.Add($row) }
+        $findings.UniqueIPs         = $ipRows.Count
+        $findings.SignInIPs         = Get-LTIIPSummaryText -Rows $ipRows -OkProperty 'AuditOK' -FailedProperty 'AuditFailed'
+        $findings.NonInteractiveIPs = Get-LTIIPSummaryText -Rows $ipRows -OkProperty 'NonInteractiveOK' -FailedProperty 'NonInteractiveFailed'
+        $countries = Get-LTICountrySummary -Rows $ipRows
+        $findings.SignInCountries   = $countries.Text
+        $findings.CountryCount      = $countries.Count
+        Add-Log "  Sign-in IPs: $($ipRows.Count)$(if($countries.Text){" | Countries: $($countries.Text)"})"
+        if ($findings.SignInIPs)         { Add-Log "    Audit log      : $($findings.SignInIPs)" }
+        if ($findings.NonInteractiveIPs) { Add-Log "    Non-interactive: $($findings.NonInteractiveIPs)" }
+    }
 
     # MFA findings come from the MFA cache (Refresh MFA / step 17). No cache entry = "NotChecked".
     $cachedMFA = $script:allMFAData | Where-Object { $_.UPN -eq $UPN } | Select-Object -First 1
@@ -2214,13 +2894,21 @@ function Get-LTIMFAVerdict {
 $btnRun.Add_Click({
     if ($lstMailboxes.SelectedItems.Count -eq 0) { [System.Windows.MessageBox]::Show("Select at least one mailbox.","Required","OK","Warning"); return }
     $enabledSteps=@{}; $enabledCount=0
-    for($i=1;$i-le 16;$i++){$enabledSteps[$i]=($chkSteps[$i].IsChecked -eq $true);if($enabledSteps[$i]){$enabledCount++}}
-    $enabledSteps[17]=($chkSteps[17].IsChecked -eq $true); if($enabledSteps[17]){$enabledCount++}
+    for($i=1;$i-le 18;$i++){$enabledSteps[$i]=($chkSteps[$i].IsChecked -eq $true);if($enabledSteps[$i]){$enabledCount++}}
     if ($enabledCount -eq 0) { [System.Windows.MessageBox]::Show("Select at least one step.","Required","OK","Warning"); return }
 
     $selectedUPNs=[System.Collections.Generic.List[string]]::new()
     foreach ($si in $lstMailboxes.SelectedItems) { if($si -match '<(.+?)>'){$selectedUPNs.Add($Matches[1])} }
     if ($selectedUPNs.Count -eq 0) { [System.Windows.MessageBox]::Show("Could not parse mailboxes.","Error","OK","Error"); return }
+
+    # Steps 17 and 18 read Microsoft Graph, and the Graph sign-in cannot be started
+    # from inside a run. Say so now rather than produce a report full of "not checked".
+    $cachedForPrompt = @($script:allMFAData | ForEach-Object { $_.UPN })
+    $needsGraph = $enabledSteps[18] -or ($enabledSteps[17] -and @($selectedUPNs | Where-Object { $cachedForPrompt -notcontains $_ }).Count -gt 0)
+    if ($needsGraph -and -not (Test-LTIGraphToken)) {
+        $answer = [System.Windows.MessageBox]::Show("Steps 17 (MFA) and 18 (Entra sign-in log) need a Microsoft Graph sign-in, and there isn't one yet.`n`nTo include them: click No, click 'Refresh MFA', complete the sign-in, then run again.`n`nRun now without them?","Graph sign-in needed","YesNo","Warning")
+        if ("$answer" -eq "No") { return }
+    }
 
     $baselinePath = ""
     $doComparison = ($chkBaseline.IsChecked -eq $true -and -not [string]::IsNullOrWhiteSpace($txtBaselinePath.Text))
@@ -2242,6 +2930,20 @@ $btnRun.Add_Click({
     Add-Log "Mailboxes: $total | Steps: $enabledCount | Days: $daysBack"
     Add-Log "Output: $rootFolder"
     if ($doComparison) { Add-Log "Baseline: $baselinePath" }
+
+    # Per-run state for the sign-in IP roll-up (step 18 and the IP summary).
+    $script:allIPRollup.Clear(); $script:LTIEntraBlocked = $null; $script:LTIGeoLookupCount = 0
+    $script:LTIGeoLookup = ($chkGeoLookup.IsChecked -eq $true)
+    if ($script:LTIGeoLookup) { Add-Log "ASN lookup: ON - IPs Microsoft did not label are sent to Team Cymru" }
+
+    # How far back do this tenant's Entra logs actually go? (7 days on Entra ID Free.)
+    $script:LTILogReach = $null
+    if (($enabledSteps[17] -or $enabledSteps[18]) -and (Test-LTIGraphToken)) {
+        $script:LTILogReach = @{ SignIns = (Test-LTIEntraLogReach -Log SignIns); Audit = (Test-LTIEntraLogReach -Log Audit) }
+        foreach ($line in (Get-LTILogReachText -Reach $script:LTILogReach -DaysBack $daysBack)) {
+            if ($line -match 'NOTHING older') { Add-Log "[WARN] $line" } else { Add-Log $line }
+        }
+    }
 
     # --- Step 17: MFA Status Export (tenant-level, runs once) ---
     if ($enabledSteps[17]) {
@@ -2281,7 +2983,7 @@ $btnRun.Add_Click({
             $null = Export-ResultSet -Name "MFA Config Audit Events" -FileName "17b_MFA_Config_Audit_Events.csv" -OutFolder $rootFolder -Data @($script:allMFAAuditRows | Where-Object { $selectedUPNs -contains $_.UPN })
         } else {
             # Deliberately NOT an empty 17_MFA_Status.csv: "no rows" reads as "nobody has MFA".
-            ("MFA WAS NOT CHECKED - " + (Get-Date -Format 'u') + "`r`nNo Microsoft Graph sign-in was completed before this run, so there is no MFA data for the selected mailboxes.`r`nClick 'Refresh MFA' in the utility, complete the sign-in, and run the investigation again.") |
+            ("MFA WAS NOT CHECKED - " + (Get-LTIStamp) + "`r`nNo Microsoft Graph sign-in was completed before this run, so there is no MFA data for the selected mailboxes.`r`nClick 'Refresh MFA' in the utility, complete the sign-in, and run the investigation again.") |
                 Out-File -FilePath (Join-Path $rootFolder "17_MFA_Status_NOT_CHECKED.txt") -Encoding UTF8
             Add-Log "  [WARN] No MFA data for the selected mailboxes -> 17_MFA_Status_NOT_CHECKED.txt"
         }
@@ -2320,23 +3022,36 @@ $btnRun.Add_Click({
             if($result.AuditEnabled -eq $false){$flags+="AUDIT OFF"}
             if($mfa.NoMFA){$flags+="MFA OFF"}elseif($enabledSteps[17] -and -not $mfa.Verified){$flags+="MFA NOT VERIFIED"}
             if($result.NewMFAMethods -gt 0){$flags+="$($result.NewMFAMethods) MFA METHOD(S) ADDED IN WINDOW"}
+            if($result.CountryCount -gt 1){$flags+="SIGN-INS FROM $($result.CountryCount) COUNTRIES"}
             if($result.Errors.Count -gt 0){$flags+="$($result.Errors.Count) ERRORS"}
             Add-Log ""; if($flags.Count -gt 0){Add-Log "  >> ALERTS: $($flags -join ' | ')"}else{Add-Log "  >> No major alerts."}
         } catch { Add-Log "  >> FAILED: $_" }
         Flush-UI
     }
 
+    # --- Sign-in IP roll-up (one row per mailbox + IP) ---
+    if ($script:allIPRollup.Count -gt 0) {
+        Add-Log ""
+        Update-LTIRollupGeo -Findings $allFindings
+        if ($script:LTIGeoLookup) {
+            foreach ($f in $allFindings) { if ($f.CountryCount -gt 1) { Add-Log "  $($f.UPN): sign-ins from $($f.CountryCount) countries - $($f.SignInCountries)" } }
+        }
+        @($script:allIPRollup) | Export-Csv -Path (Join-Path $rootFolder "_SIGNIN_IP_SUMMARY.csv") -NoTypeInformation -Encoding UTF8
+        Add-Log ""; Add-Log "Sign-in IP summary: $($script:allIPRollup.Count) mailbox/IP row(s) -> _SIGNIN_IP_SUMMARY.csv"
+    }
+
     # --- Master CSV ---
     $csvPath=Join-Path $rootFolder "_MASTER_SUMMARY.csv"
     # MFAEnabled is True / False, or blank when MFA was not checked or the lookup failed (see MFAStatus).
-    $csvData=foreach($f in $allFindings){$mfa=Get-LTIMFAVerdict -Findings $f;[PSCustomObject]@{UPN=$f.UPN;DisplayName=$f.DisplayName;MFAEnabled=$mfa.EnabledText;MFAStatus=$f.MFAStatus;MFAMethods=$f.MFAMethods;NewMFAMethods=$f.NewMFAMethods;SignInAllowed=$f.AccountEnabled;SignInsOK=$f.SignInsOK;SignInsFailed=$f.SignInsFailed;UniqueIPs=$f.UniqueIPs;SignInIPs=$f.SignInIPs;ForwardingActive=$f.ForwardingActive;ForwardingTarget=$f.ForwardingTarget;SuspiciousRules=$f.SuspiciousRules;TotalRules=$f.TotalRules;OAuthConsents=$f.OAuthConsents;AdminActions=$f.AdminActions;FileEvents=$f.FileEvents;OutboundMail=$f.OutboundMail;AuditEnabled=$f.AuditEnabled;Errors=($f.Errors -join '; ')}}
+    $csvData=foreach($f in $allFindings){$mfa=Get-LTIMFAVerdict -Findings $f;[PSCustomObject]@{UPN=$f.UPN;DisplayName=$f.DisplayName;MFAEnabled=$mfa.EnabledText;MFAStatus=$f.MFAStatus;MFAMethods=$f.MFAMethods;NewMFAMethods=$f.NewMFAMethods;SignInAllowed=$f.AccountEnabled;SignInsOK=$f.SignInsOK;SignInsFailed=$f.SignInsFailed;UniqueIPs=$f.UniqueIPs;SignInIPs=$f.SignInIPs;SignInCountries=$f.SignInCountries;EntraSignInLog=$f.EntraSignInLog;EntraInteractive=$f.EntraInteractive;EntraNonInteractive=$f.EntraNonInteractive;NonInteractiveIPs=$f.NonInteractiveIPs;ForwardingActive=$f.ForwardingActive;ForwardingTarget=$f.ForwardingTarget;SuspiciousRules=$f.SuspiciousRules;TotalRules=$f.TotalRules;OAuthConsents=$f.OAuthConsents;AdminActions=$f.AdminActions;FileEvents=$f.FileEvents;OutboundMail=$f.OutboundMail;AuditEnabled=$f.AuditEnabled;Errors=($f.Errors -join '; ')}}
     @($csvData)|Export-Csv -Path $csvPath -NoTypeInformation -Encoding UTF8; Add-Log "Master CSV: $csvPath"
 
     # --- Master TXT ---
     $txtPath=Join-Path $rootFolder "_MASTER_SUMMARY.txt"; $sl=[System.Collections.Generic.List[string]]::new()
     $sl.Add("LTI MS365 Investigation Utility - Master Summary"); $sl.Add("================================================")
-    $sl.Add("Generated : $(Get-Date -Format 'u')"); $sl.Add("Date Range: $($startDate.ToString('yyyy-MM-dd')) to $($endDate.ToString('yyyy-MM-dd'))")
-    $sl.Add("Steps Run : $enabledCount"); $sl.Add("Mailboxes : $total investigated"); $sl.Add("")
+    $sl.Add("Generated : $(Get-LTIStamp)"); $sl.Add("Date Range: $(Format-LTIDateTime $startDate) to $(Format-LTIDateTime $endDate) ($daysBack days back; all times in this report are UTC)")
+    $sl.Add("Steps Run : $enabledCount  (tool $($script:LTIVersion))"); $sl.Add("Mailboxes : $total investigated"); $sl.Add("")
+    $notesAt=$sl.Count
     $alertCount=0
     foreach($f in $allFindings){$mfa=Get-LTIMFAVerdict -Findings $f
         $ha=$f.ForwardingActive -or $f.SuspiciousRules -gt 0 -or $f.SignInsFailed -gt 10 -or $f.OAuthConsents -gt 0 -or $mfa.NoMFA -or $f.NewMFAMethods -gt 0; if($ha){$alertCount++}
@@ -2344,13 +3059,23 @@ $btnRun.Add_Click({
         if($f.NewMFAMethods -gt 0){$sl.Add("      *** $($f.NewMFAMethods) MFA METHOD(S) ADDED IN THE INVESTIGATION WINDOW - see 17a_MFA_Method_Details.csv")}
         $sl.Add("      Sign-ins: $($f.SignInsOK) ok / $($f.SignInsFailed) failed / $($f.UniqueIPs) IPs")
         if($f.SignInIPs){$sl.Add("      IPs: $($f.SignInIPs)")}
+        if($f.EntraSignInLog -ne "Not run"){
+            if($f.EntraInteractive){$sl.Add("      Entra log: interactive $($f.EntraInteractive)$(if($f.EntraNonInteractive){" | non-interactive $($f.EntraNonInteractive)"})")}
+            if($f.EntraSignInLog -ne "OK" -and $f.EntraSignInLog -ne "OK - tenant log only holds the last 7 days"){$sl.Add("      Entra log status: $($f.EntraSignInLog)")}
+            if($f.NonInteractiveIPs){$sl.Add("      Non-interactive IPs: $($f.NonInteractiveIPs)")}
+        }
+        if($f.SignInCountries){$sl.Add("      $(if($f.CountryCount -gt 1){'*** '})Countries: $($f.SignInCountries)")}
         if($f.ForwardingActive){$sl.Add("      *** FORWARDING -> $($f.ForwardingTarget)")}; if($f.SuspiciousRules -gt 0){$sl.Add("      *** $($f.SuspiciousRules) SUSPICIOUS RULES")}
         if($f.OAuthConsents -gt 0){$sl.Add("      *** $($f.OAuthConsents) OAuth consents")}
         if($f.AuditEnabled -eq $false){$sl.Add("      *** Auditing DISABLED")}elseif($null -eq $f.AuditEnabled){$sl.Add("      Auditing: not checked")}
         if($f.Errors.Count -gt 0){$sl.Add("      Errors: $($f.Errors -join '; ')")}; $sl.Add("")}
-    $sl.Insert(7,"ALERTS  : $alertCount mailbox(es) with suspicious findings")
-    $sl.Insert(8,"MFA NOTE: 'Enabled' means an MFA-capable method is registered. It does not prove MFA is enforced (Conditional Access / Security Defaults are not checked).")
-    $sl.Insert(9,"")
+    $notes=[System.Collections.Generic.List[string]]::new()
+    $notes.Add("ALERTS  : $alertCount mailbox(es) with suspicious findings")
+    $notes.Add("MFA NOTE: 'Enabled' means an MFA-capable method is registered. It does not prove MFA is enforced (Conditional Access / Security Defaults are not checked).")
+    $notes.Add("IP NOTE : Country / ASN come from Microsoft's sign-in geolocation (step 18)$(if($script:LTIGeoLookup){'; IPs it did not label carry the country their address block is REGISTERED in, which is not a location'}). Audit-log and Entra-log counts overlap for interactive sign-ins - do not add them. Details: _SIGNIN_IP_SUMMARY.csv")
+    foreach($line in (Get-LTILogReachText -Reach $script:LTILogReach -DaysBack $daysBack)){$notes.Add("LOG NOTE: $line")}
+    $notes.Add("")
+    $sl.InsertRange($notesAt,$notes)
     ($sl -join "`r`n")|Out-File -FilePath $txtPath -Encoding UTF8
 
     # --- BASELINE COMPARISON ---
@@ -2398,7 +3123,7 @@ $btnRun.Add_Click({
         $cLines = [System.Collections.Generic.List[string]]::new()
         $cLines.Add("LTI MS365 Investigation Utility - Baseline Changes Summary")
         $cLines.Add("==========================================================")
-        $cLines.Add("Generated : $(Get-Date -Format 'u')")
+        $cLines.Add("Generated : $(Get-LTIStamp)")
         $cLines.Add("Baseline  : $baselinePath")
         $cLines.Add("Current   : $rootFolder")
         $cLines.Add("Users with changes: $usersWithChanges of $($changesSummary.Count)")
